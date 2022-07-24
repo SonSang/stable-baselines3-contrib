@@ -235,6 +235,23 @@ class DiffTRPO(DiffOnPolicyAlgorithm):
         grad_kl = th.cat(grad_kl)
         return actor_params, policy_objective_gradients, grad_kl, grad_shape
 
+    def diff_surrogate_objective(self, 
+                                grad_eps,
+                                action_distribution,
+                                rollout_data,
+                                policy_objective: th.Tensor):
+        grad_eps_vec = th.ones_like(rollout_data.p_grad_qvalues_max) * grad_eps
+        p_grad_qvalues_mag, _ = th.min(th.cat((rollout_data.p_grad_qvalues_max.unsqueeze(-1), grad_eps_vec.unsqueeze(-1)), dim=1), dim=1)
+        p_actions = rollout_data.actions + rollout_data.p_grad_qvalues * p_grad_qvalues_mag.unsqueeze(-1)
+        
+        p_log_prob = action_distribution.log_prob(p_actions)
+        log_diff = th.abs(p_log_prob - rollout_data.old_log_prob).mean()
+        if policy_objective is not None:
+            with th.no_grad():
+                scale = th.abs(policy_objective) / log_diff * 0.1   # 10 % of policy objective
+            log_diff *= scale
+        return log_diff
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -264,7 +281,6 @@ class DiffTRPO(DiffOnPolicyAlgorithm):
                 )
 
             actions = rollout_data.actions
-            p_actions = rollout_data.p_actions
 
             assert not isinstance(self.action_space, spaces.Discrete), ""
             # if isinstance(self.action_space, spaces.Discrete):
@@ -282,139 +298,161 @@ class DiffTRPO(DiffOnPolicyAlgorithm):
                 # directly to avoid PyTorch errors.
                 old_distribution = copy.copy(self.policy.get_distribution(rollout_data.observations))
 
-            distribution = self.policy.get_distribution(rollout_data.observations)
-            log_prob = distribution.log_prob(actions)
-            p_log_prob = distribution.log_prob(p_actions)
+            '''
+            Gradients are involved in [policy objective] to enhance training efficiency
+            '''
+            # Backup network parameters before entering iteration to find optimal gradient size [grad_eps]
+            grad_eps = 0.0
+            old_policy_params = self.policy.state_dict()
+            for diff_iter in range(20):
+                self.policy.load_state_dict(old_policy_params)
 
-            # Process weights
-            weights = th.ones(rollout_data.p_weights.shape)
-            p_weights = rollout_data.p_weights
-            weights_sum = weights + p_weights
-            weights = weights / weights_sum
-            p_weights = p_weights / weights_sum
+                distribution = self.policy.get_distribution(rollout_data.observations)
+                log_prob = distribution.log_prob(actions)
 
-            advantages = rollout_data.advantages
-            p_advantages = rollout_data.p_advantages
-            if self.normalize_advantage:
-                if not self.policy_enhancement:
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
                     advantages = (advantages - advantages.mean()) / (rollout_data.advantages.std() + 1e-8)
-                else:
-                    total_advantages = th.concat((advantages, p_advantages))
-                    total_weights = th.concat((weights, p_weights))
-                    w_total_advantages_mean = weighted_mean(total_advantages, total_weights)
-                    w_total_advantages_std = weighted_std(total_advantages, total_weights)
+                    
+                # ratio between old and new policy, should be one at the first iteration
+                ratio = th.exp(log_prob - rollout_data.old_log_prob)
 
-                    advantages = (advantages - w_total_advantages_mean) / (w_total_advantages_std + 1e-8)
-                    p_advantages = (p_advantages - w_total_advantages_mean) / (w_total_advantages_std + 1e-8)
-
-            # ratio between old and new policy, should be one at the first iteration
-            ratio = th.exp(log_prob - rollout_data.old_log_prob)
-            p_ratio = th.exp(p_log_prob - rollout_data.p_old_log_prob)
-
-            # surrogate policy objective
-            if not self.policy_enhancement:
+                # surrogate policy objective
                 policy_objective = (advantages * ratio).mean()
-            else:
-                # clipped surrogate loss
-                policy_objective = advantages * ratio
-                p_policy_objective = p_advantages * p_ratio
 
-                policy_objective = th.concat((policy_objective, p_policy_objective))
-                total_weights = th.concat((weights, p_weights))
+                '''
+                Expand surrogate policy objective with gradients
+                '''
+                if self.policy_enhancement:
+                    diff_objective = self.diff_surrogate_objective(grad_eps, distribution, rollout_data, policy_objective)
+                    policy_objective -= diff_objective
 
-                policy_objective = weighted_mean(policy_objective, total_weights)
+                # KL divergence
+                kl_div = kl_divergence(distribution.distribution, old_distribution.distribution).mean()
 
-            # KL divergence
-            kl_div = kl_divergence(distribution.distribution, old_distribution.distribution).mean()
+                # Surrogate & KL gradient
+                self.policy.optimizer.zero_grad()
 
-            # Surrogate & KL gradient
-            self.policy.optimizer.zero_grad()
+                actor_params, policy_objective_gradients, grad_kl, grad_shape = self._compute_actor_grad(kl_div, policy_objective)
 
-            actor_params, policy_objective_gradients, grad_kl, grad_shape = self._compute_actor_grad(kl_div, policy_objective)
+                # Hessian-vector dot product function used in the conjugate gradient step
+                hessian_vector_product_fn = partial(self.hessian_vector_product, actor_params, grad_kl)
 
-            # Hessian-vector dot product function used in the conjugate gradient step
-            hessian_vector_product_fn = partial(self.hessian_vector_product, actor_params, grad_kl)
+                # Computing search direction
+                search_direction = conjugate_gradient_solver(
+                    hessian_vector_product_fn,
+                    policy_objective_gradients,
+                    max_iter=self.cg_max_steps,
+                )
 
-            # Computing search direction
-            search_direction = conjugate_gradient_solver(
-                hessian_vector_product_fn,
-                policy_objective_gradients,
-                max_iter=self.cg_max_steps,
-            )
+                # Maximal step length
+                line_search_max_step_size = 2 * self.target_kl
+                line_search_max_step_size /= th.matmul(
+                    search_direction, hessian_vector_product_fn(search_direction, retain_graph=False)
+                )
+                line_search_max_step_size = th.sqrt(line_search_max_step_size)
 
-            # Maximal step length
-            line_search_max_step_size = 2 * self.target_kl
-            line_search_max_step_size /= th.matmul(
-                search_direction, hessian_vector_product_fn(search_direction, retain_graph=False)
-            )
-            line_search_max_step_size = th.sqrt(line_search_max_step_size)
+                line_search_backtrack_coeff = 1.0
+                original_actor_params = [param.detach().clone() for param in actor_params]
 
-            line_search_backtrack_coeff = 1.0
-            original_actor_params = [param.detach().clone() for param in actor_params]
+                is_line_search_success = False
+                with th.no_grad():
+                    # Line-search (backtracking)
+                    for _ in range(self.line_search_max_iter):
 
-            is_line_search_success = False
-            with th.no_grad():
-                # Line-search (backtracking)
-                for _ in range(self.line_search_max_iter):
+                        start_idx = 0
+                        # Applying the scaled step direction
+                        for param, original_param, shape in zip(actor_params, original_actor_params, grad_shape):
+                            n_params = param.numel()
+                            param.data = (
+                                original_param.data
+                                + line_search_backtrack_coeff
+                                * line_search_max_step_size
+                                * search_direction[start_idx : (start_idx + n_params)].view(shape)
+                            )
+                            start_idx += n_params
 
-                    start_idx = 0
-                    # Applying the scaled step direction
-                    for param, original_param, shape in zip(actor_params, original_actor_params, grad_shape):
-                        n_params = param.numel()
-                        param.data = (
-                            original_param.data
-                            + line_search_backtrack_coeff
-                            * line_search_max_step_size
-                            * search_direction[start_idx : (start_idx + n_params)].view(shape)
-                        )
-                        start_idx += n_params
+                        # Recomputing the policy log-probabilities
+                        distribution = self.policy.get_distribution(rollout_data.observations)
+                        log_prob = distribution.log_prob(actions)
 
-                    # Recomputing the policy log-probabilities
-                    distribution = self.policy.get_distribution(rollout_data.observations)
-                    log_prob = distribution.log_prob(actions)
-                    p_log_prob = distribution.log_prob(p_actions)
+                        # New policy objective
+                        ratio = th.exp(log_prob - rollout_data.old_log_prob)
 
-                    # New policy objective
-                    ratio = th.exp(log_prob - rollout_data.old_log_prob)
-                    p_ratio = th.exp(p_log_prob - rollout_data.p_old_log_prob)
-
-                    if not self.policy_enhancement:
                         new_policy_objective = (advantages * ratio).mean()
+
+                        if self.policy_enhancement:
+                            new_diff_objective = self.diff_surrogate_objective(grad_eps, distribution, rollout_data, new_policy_objective)
+                            new_policy_objective -= new_diff_objective
+
+                        # New KL-divergence
+                        kl_div = kl_divergence(distribution.distribution, old_distribution.distribution).mean()
+
+                        # Constraint criteria:
+                        # we need to improve the surrogate policy objective
+                        # while being close enough (in term of kl div) to the old policy
+                        if (kl_div < self.target_kl) and (new_policy_objective > policy_objective):
+                            is_line_search_success = True
+                            break
+
+                        # Reducing step size if line-search wasn't successful
+                        line_search_backtrack_coeff *= self.line_search_shrinking_factor
+
+                    line_search_results.append(is_line_search_success)
+
+                    if not is_line_search_success:
+                        '''
+                        Even when using policy enhancement, if [diff_iter] was 0,
+                        which means grad_eps was zero, we have to just break
+                        '''
+                        if not self.policy_enhancement or diff_iter == 0:
+                            # If the line-search wasn't successful we revert to the original parameters
+                            for param, original_param in zip(actor_params, original_actor_params):
+                                param.data = original_param.data.clone()
+
+                            policy_objective_values.append(policy_objective.item())
+                            kl_divergences.append(0)
+
+                            break
+                        else:
+                            '''
+                            Using policy enhancement and [diff_iter] is larger than 0,
+                            then we have to revert back to successful version from last [diff_iter]
+                            '''
+                            self.policy.load_state_dict(last_policy_params)                            
+                            break
                     else:
-                        # clipped surrogate loss
-                        new_policy_objective = advantages * ratio
-                        new_p_policy_objective = p_advantages * p_ratio
+                        if not self.policy_enhancement:
+                            policy_objective_values.append(new_policy_objective.item())
+                            kl_divergences.append(kl_div.item())
+                            break
+                        else:
+                            last_policy_params = self.policy.state_dict()
+                            policy_objective_values.append(new_policy_objective.item())
+                            kl_divergences.append(kl_div.item())
 
-                        new_policy_objective = th.concat((new_policy_objective, new_p_policy_objective))
-                        total_weights = th.concat((weights, p_weights))
+                '''
+                Find optimal [grad_eps] that minimizes diff surrogate objective
+                '''
+                grad_eps = th.tensor([grad_eps], requires_grad=True)
+                grad_eps_optimizer = th.optim.Adam([grad_eps])
 
-                        new_policy_objective = weighted_mean(new_policy_objective, total_weights)
+                with th.no_grad():
+                    new_distribution = self.policy.get_distribution(rollout_data.observations)
+                for _ in range(20):
+                    diff_objective = self.diff_surrogate_objective(grad_eps, new_distribution, rollout_data, None)
+                    grad_eps_optimizer.zero_grad()
+                    diff_objective.backward()
+                    grad_eps_optimizer.step()
 
-                    # New KL-divergence
-                    kl_div = kl_divergence(distribution.distribution, old_distribution.distribution).mean()
+                grad_eps = grad_eps.detach().item()
 
-                    # Constraint criteria:
-                    # we need to improve the surrogate policy objective
-                    # while being close enough (in term of kl div) to the old policy
-                    if (kl_div < self.target_kl) and (new_policy_objective > policy_objective):
-                        is_line_search_success = True
-                        break
-
-                    # Reducing step size if line-search wasn't successful
-                    line_search_backtrack_coeff *= self.line_search_shrinking_factor
-
-                line_search_results.append(is_line_search_success)
-
-                if not is_line_search_success:
-                    # If the line-search wasn't successful we revert to the original parameters
-                    for param, original_param in zip(actor_params, original_actor_params):
-                        param.data = original_param.data.clone()
-
-                    policy_objective_values.append(policy_objective.item())
-                    kl_divergences.append(0)
-                else:
-                    policy_objective_values.append(new_policy_objective.item())
-                    kl_divergences.append(kl_div.item())
+                '''
+                [grad_eps] should not be negative value.
+                But if it is, just quit.
+                '''
+                if grad_eps < 0:
+                    break
 
         # Critic update
         for _ in range(self.n_critic_updates):
